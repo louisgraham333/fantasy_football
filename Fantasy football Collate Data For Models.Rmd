@@ -1,0 +1,626 @@
+---
+title: "Fantasy Football Make Models"
+output: html_document
+---
+
+
+####################################################################################
+#Chapter 1: Setting up the script
+####################################################################################
+
+
+Clear Everything from memory 
+```{r, echo=FALSE}
+rm(list=ls())
+```
+
+Set wd, install packages and disable scientific notation
+```{r setup, include=FALSE, echo=FALSE}
+# Set up working directory
+path <- paste("/Users/busara/Dropbox/Fantasy Football")
+knitr::opts_knit$set(root.dir = normalizePath(path))
+
+# Prevent scientific notation
+knitr::opts_knit$set(options(scipen=999))
+
+# Install and load all the packages that will be used for analysis
+pkgs <- c("tidyr", "lubridate", "data.table", "dplyr", "readxl", "ggplot2",
+          "stringi", "adagio", "lpSolve", 'readr')
+
+miss_pkgs <- pkgs[!pkgs %in% installed.packages()[,1]] # vector of missing packages
+if(length(miss_pkgs)>0){
+  install.packages(miss_pkgs)
+}
+invisible(lapply(pkgs,library,character.only=TRUE))
+
+# Clear our memory by removing objects that are no longer needed.
+rm(miss_pkgs, pkgs, path)
+```
+
+
+####################################################################################
+#Chapter 2: Build up a database of previous games from fantasy football
+####################################################################################
+
+Pull in a database of every player from 2020/21 with fixture data
+https://github.com/vaastav/Fantasy-Premier-League/tree/master/data
+```{r, echo=FALSE, message=FALSE}
+###Loop through all player data
+list_files <- list.files(path="Data/2020-21/gws", pattern="^gw*", full.names=TRUE)
+players_20_21 <- tibble()
+for(i in list_files){
+  tryCatch({
+    data <- read_csv(i)
+    players_20_21 <- rbind(players_20_21,data)
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+###Add in fixture data
+fixtures_20_21 <- read_csv("Data/2020-21/fixtures.csv")
+fixtures_20_21 <- fixtures_20_21 %>%
+  rename(fixture = id) 
+players_20_21 <- left_join(players_20_21, fixtures_20_21, by = "fixture") %>%
+  mutate(season = "20-21")
+rm(list_files, i, data, fixtures_20_21)
+```
+
+Add in stats for set piece takers
+```{r, echo=FALSE, message=FALSE}
+#Open player data from 2020 with set piece details, and create a new name for merging
+set_pieces <- read_csv("Data/2020-21/players_raw.csv") %>%
+  mutate(name = paste(first_name, second_name))
+#Change all to normal string for merge
+players_20_21$name <- stri_trans_general(players_20_21$name,"Latin-ASCII")
+set_pieces$name <- stri_trans_general(set_pieces$name,"Latin-ASCII")
+#Keep only the set pieces (and just the top 3 for consistency with the others)
+set_pieces <- set_pieces %>% 
+  select(name, corners_and_indirect_freekicks_order, penalties_order) %>%
+  rename(corner_order = corners_and_indirect_freekicks_order) %>%
+  mutate(corner_order = ifelse(corner_order %in% c(1,2,3),
+                               corner_order, 99)) %>%
+  mutate(corner_dummy = ifelse(corner_order %in% c(1,2,3),
+                               1, 0)) %>%
+  mutate(penalties_order = ifelse(penalties_order %in% c(1,2,3),
+                                  penalties_order, 99)) %>%
+  mutate(penalties_dummy = ifelse(penalties_order %in% c(1,2,3),
+                                  1, 0))
+#Merge
+players_20_21 <- left_join(players_20_21, set_pieces, by = "name")
+rm(set_pieces)
+```
+
+Pull in a database of every player from 2019/20 with fixture data
+```{r, echo=FALSE, message=FALSE}
+###Loop through all player data
+list_files <- list.files(path="Data/2019-20/gws", pattern="^gw*", full.names=TRUE)
+players_19_20 <- tibble()
+for(i in list_files){
+  tryCatch({
+    data <- read_csv(i)
+    data$name <- gsub("_", " ", data$name)
+    data$name <- stri_trans_general(data$name,"Latin-ASCII")
+    data$name <- gsub('[0-9]+', '', data$name)
+    data$name = trimws(data$name)
+    players_19_20 <- rbind(players_19_20,data)
+  }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+###Add in fixture data
+fixtures_19_20 <- read_csv("Data/2019-20/fixtures.csv")
+fixtures_19_20 <- fixtures_19_20 %>%
+  rename(fixture = id)
+players_19_20 <- left_join(players_19_20, fixtures_19_20, by = "fixture") %>%
+  mutate(season = "19-20")
+rm(list_files, i, data, fixtures_19_20)
+```
+
+Add in stats for set piece takers (https://www.rotowire.com/soccer/article.php?id=46462)
+```{r, echo=FALSE, message=FALSE}
+players_19_20$penalties_order <-
+  ifelse(players_19_20$name %in% c("Pierre-Emerick Aubameyang", "Jonathan Kodjia", "Joshua King",
+                            "Glenn Murray", "Ashley Barnes", "Ross Barkley", "Luka Milivojevic",
+                            "Gylfi Sigurdsson", "Jamie Vardy", "James Milner", "Sergio Aguero",
+                            "Paul Pogba", "Matt Ritchie", "Mario Vrancic", "David McGoldrick",
+                            "Danny Ings", "Harry Kane", "Troy Deeney", "Mark Noble",
+                            "Ruben Diogo da Silva Neves"), 1,
+     ifelse(players_19_20$name %in% c("Alexandre Lacazette", "Jack Grealish", "Callum Wilson", "Pascal Gross",
+                                   "Chris Wood", "Tammy Abraham", "Christian Benteke", "Lucas Digne",
+                                   "James Maddison", "Mohamed Salah", "Gabriel Fernando de Jesus",
+                                   "Anthony Martial", "Dwight Gayle", "Teemu Pukki",
+                                   "Billy Sharp", "James Ward-Prowse	", "Bamidele Alli",
+                                   "Andre Gray", "Sebastien Haller", "Raul Jimenez" ), 2,
+         ifelse(players_19_20$name %in% c("Junior Stanislas", "Jorge Luiz Frello Filho", "Leighton Baines",
+                                          "Roberto Firmino", "Riyad Mahrez", "Romelu Lukaku", "Oliver Norwood",
+                                          "Charlie Austin", "Christian Eriksen"), 3, 99)))
+players_19_20$penalties_dummy <- ifelse(players_19_20$penalties_order %in% c(1,2,3), 1, 0)
+players_19_20$corner_order <- 
+  ifelse(players_19_20$name %in% c("Granit Xhaka", "Conor Hourihane", "Ryan Fraser", "Pascal Gross", 
+                                   "Johann Berg Gudmundsson", "Willian Borges Da Silva",
+                                   "Luka Milivojevic", "Gylfi Sigurdsson", "James Maddison",
+                                   "Trent Alexander-Arnold", "Kevin De Bruyne", "Ashley Young",
+                                   "Matt Ritchie", "Emiliano Buendia", "Oliver Norwood", "James Ward-Prowse",
+                                   "Christian Eriksen", "Jose Holebas", "Robert Snodgrass", 
+                                   "Joao Filipe Iria Santos Moutinho"), 1, 
+      ifelse(players_19_20$name %in% c("Mesut Ozil", "Jack Grealish", "Junior Stanislas",
+                                       "Solomon March", "Dwight McNeil", "Christian Pulisic",
+                                       "Andros Townsend", "Lucas Digne", "Demarai Gray",
+                                       "James Milner", "Ilkay Gundogan", "Juan Mata", "Jonjo Shelvey",
+                                       "Moritz Leitner", "John Fleck", "Ryan Bertrand", "Erik Lamela",
+                                       "Roberto Pereyra", "Felipe Anderson Pereira Gomes",
+                                       "Ivan Cavaleiro"), 2,
+          ifelse(players_19_20$name %in% c("Henrikh Mkhitaryan", "Matt Targett", "David Brooks",
+                                           "Alireza Jahanbakhsh", "Robbie Brady", "Mason Mount",
+                                           "Max Meyer", "Bernard Anicio Caldeira Duarte", "Benjamin Chilwell",
+                                           "Mohamed Salah", "Leroy Sane", "Marcus Rashford",
+                                           "Sung-yueng Ki", "Mario Vrancic", "Mohamed Elyounoussi",
+                                           "Danny Rose", "Gerard Deulofeu", "Aaron Cresswell",
+                                           "Helder Costa"), 3, 99)))
+players_19_20$corner_dummy <- ifelse(players_19_20$corner_order %in% c(1,2,3), 1, 0)
+```
+
+Add in positions
+```{r, echo=FALSE, message=FALSE}
+positions_19_20 <- fread("Data/2019-20/players_raw.csv") %>%
+  mutate(name = paste(first_name, second_name)) %>%
+  mutate(name = sub("^\\d+|\\d+$", "", name)) %>%
+  mutate(name = stri_trans_general(name,"Latin-ASCII"))  %>%
+  mutate(position = recode(element_type, `1` = "GK", `2` = "DEF", `3` = "MID", `4` = "FWD")) %>%
+  select(name, position) 
+players_19_20 <- left_join(players_19_20, positions_19_20, by = "name")
+rm(positions_19_20)
+```
+
+
+Pull in a database of every player from 2018/19 with fixture data
+```{r, echo=FALSE, message=FALSE}
+###Loop through all player data
+parent_folder <- "Data/2018-19/players"
+sub_folders <- list.dirs(parent_folder, recursive=TRUE)[-1]
+players_18_19 <- tibble()
+for(i in sub_folders){
+  data <- read_csv(paste(i,"/gw.csv",sep = ""))
+  data$name = sub('Data/2018-19/players/',"",i)
+  data$name = sub("^\\d+|\\d+$", "",data$name)
+  data$name = substr(data$name, 1, nchar(data$name)-1)
+  data$name = stri_trans_general(data$name,"Latin-ASCII")
+  data$name <- gsub("_", " ", data$name)
+  players_18_19 <- rbind(players_18_19,data)
+}
+###Add in fixture data
+fixtures_18_19 <- read_csv("Data/2018-19/fixtures.csv")
+fixtures_18_19 <- fixtures_18_19 %>%
+  rename(fixture = id)
+players_18_19 <- left_join(players_18_19, fixtures_18_19, by = "fixture") %>%
+  mutate(season = "18-19")
+rm(parent_folder, sub_folders, i, data, fixtures_18_19)
+```
+
+Add in stats for set piece takers (https://fplglory.com/set-piece-takers/)
+```{r, echo=FALSE, message=FALSE}
+players_18_19$penalties_order <-
+  ifelse(players_18_19$name %in% c("Pierre-Emerick_Aubameyang", "Joshua_King", "Pascal_Gross",
+                                   "Chris_Wood", "Joe_Ralls", "Eden_Hazard",
+                                   "Luka_Milivojevic", "Leighton_Baines", "Aboubakar_Kamara",
+                                   "Aaron_Mooy", "Jamie_Vardy", "Sadio_Mane", 
+                                   "Sergio_Aguero", "Alexis_Sanchez", "Matt_Ritchie", 
+                                   "Charlie_Austin", "Harry_Kane", "Troy_Deeney", 
+                                   "Mark_Noble", "Ruben Diogo_da Silva Neves"), 1,
+     ifelse(players_18_19$name %in% c("Alexandre_Lacazette", "Callum_Wilson", "Glenn_Murray",
+                                   "Sam_Vokes", "Bobby_Reid", "Cesc_Fabregas",
+                                   "Christian_Benteke", "Gylfi_Sigurdsson", 
+                                   "Rajiv_van La Parra", "James_Maddison", "Fabio Henrique_Tavares",
+                                   "Ilkay_Gundogan", "Paul_Pogba", "Dwight_Gayle", 
+                                   "Manolo_Gabbiadini", "Bamidele_Alli", "Tom_Cleverley",
+                                   "Manuel_Lanzini", "Diogo_Jota"), 2,
+         ifelse(players_18_19$name %in% c("Mesut_Ozil", "Junior_Stanislas", "Tomer_Hemed",
+                                          "Ashley_Barnes", "David Junior_Hoilett", "Alvaro_Morata", 
+                                          "Connor_Wickham", "Cenk_Tosun",
+                                          "Chris_Lowe", "Mohamed_Salah", 
+                                          "Riyad_Mahrez", "Anthony_Martial", "Christian_Atsu", 
+                                          "Ryan_Bertrand", "Erik_Lamela", "Andre_Gray", 
+                                          "Andy_Carroll", "Bonatini Lohner Maia_Bonatini"), 3, 99)))
+players_18_19$penalties_dummy <- ifelse(players_18_19$penalties_order %in% c(1,2,3), 1, 0)
+
+players_18_19$corner_order <- 
+  ifelse(players_18_19$name %in% c("Granit_Xhaka", "Jordon_Ibe", "Pascal_Gross", 
+                                   "Johann Berg_Gudmundsson", "Joe_Ralls", "Cesc_Fabregas", 
+                                   "Andros_Townsend", "Gylfi_Sigurdsson", "Stefan_Johansen", 
+                                   "Aaron_Mooy", "Marc_Albrighton", "James_Milner", 
+                                   "Kevin_De Bruyne", "Juan_Mata", 
+                                   "Matt_Ritchie", "James_Ward-Prowse",
+                                   "Kieran_Trippier", "Jose_Holebas", "Aaron_Cresswell",
+                                   "Ivan_Cavaleiro"), 1, 
+      ifelse(players_18_19$name %in% c("Mesut_Ozil", "Ryan_Fraser", "Anthony_Knockaert",
+                                       "Robbie_Brady", "David Junior_Hoilett", "Willian_Borges Da Silva",
+                                       "Patrick_van Aanholt", "Leighton_Baines", "Kevin_McDonald", 
+                                       "Chris_Lowe", "James_Maddison", "Jordan_Henderson", 
+                                       "Riyad_Mahrez", "Ashley_Young", 
+                                       "Jonjo_Shelvey", "Sofiane_Boufal", 
+                                       "Danny_Rose", "Tom_Cleverley", "Manuel_Lanzini",
+                                       "Ruben Diogo_da Silva Neves"), 2,
+          ifelse(players_18_19$name %in% c("Henrikh_Mkhitaryan", "Andrew_Surman", "Markus_Suttner",
+                                           "Steven_Defour", "Josh_Murphy", "Pedro_Rodriguez Ledesma",
+                                           "James_McArthur", "Theo_Walcott", "Ryan_Sessegnon",
+                                           "Christian_Fuchs", "Mohamed_Salah", 
+                                           "David_Silva", "Alexis_Sanchez", 
+                                           "Robert Kenedy_Nunes do Nascimento", "Mohamed_Elyounoussi",
+                                           "Christian_Eriksen", "Etienne_Capoue", "Mark_Noble",
+                                           "Romain_Saiss"), 3, 99)))
+players_18_19$corner_dummy <- ifelse(players_18_19$corner_order %in% c(1,2,3), 1, 0)
+```
+
+Add in positions
+```{r, echo=FALSE, message=FALSE}
+positions_18_19 <- fread("Data/2018-19/players_raw.csv") %>%
+  mutate(name = paste(first_name, second_name)) %>%
+  mutate(name = sub("^\\d+|\\d+$", "", name)) %>%
+  mutate(name = stri_trans_general(name,"Latin-ASCII"))   %>%
+  mutate(position = recode(element_type, `1` = "GK", `2` = "DEF", `3` = "MID", `4` = "FWD")) %>%
+  select(name, position) 
+players_18_19 <- left_join(players_18_19, positions_18_19, by = "name")
+rm(positions_18_19)
+```
+
+
+Pull in a database of every player from 2017/18 
+```{r, echo=FALSE, message=FALSE}
+###Loop through all player data
+parent_folder <- "Data/2017-18/players"
+sub_folders <- list.dirs(parent_folder, recursive=TRUE)[-1]
+players_17_18 <- tibble()
+for(i in sub_folders){
+  data <- read_csv(paste(i,"/gw.csv",sep = ""))
+  data$name = sub('Data/2017-18/players/',"",i)
+  data$name = sub("^\\d+|\\d+$", "",data$name)
+  data$name = stri_trans_general(data$name,"Latin-ASCII")
+  data$name <- gsub("_", " ", data$name)
+  players_17_18 <- rbind(players_17_18,data)
+}
+rm(data, parent_folder, sub_folders)
+```
+
+Add in stats for set piece takers (https://www.walesonline.co.uk/sport/football/football-news/premier-league-fantasy-football-tips-13446325)
+```{r, echo=FALSE, message=FALSE}
+players_17_18$penalties_order <-
+  ifelse(players_17_18$name %in% c("Alexandre Lacazette", "Callum Wilson", "Glenn Murray",
+                                   "Andre Gray", "Eden Hazard",
+                                   "Luka Milivojevic", "Leighton Baines", "Chris Lowe",
+                                   "Riyad Mahrez", "James Milner", "Sergio Aguero",
+                                   "Romelu Lukaku", "Matt Ritchie", "Charlie Austin",
+                                   "Charlie Adam", "Gylfi Sigurdsson", "Harry Kane",
+                                   "Troy Deeney", "Nacer Chadli", "Mark Noble"), 1,
+     ifelse(players_17_18$name %in% c("Alexis Sanchez", "Joshua King", "Tomer Hemed",
+                                      "Ashley Barnes", "Cesc Fabregas",
+                                      "Christian Benteke", "Wayne Rooney", "Aaron Mooy",
+                                      "Islam Slimani", "Roberto Firmino", "Gabriel Fernando de Jesus",
+                                      "Paul Pogba", "Dwight Gayle", "Manolo Gabbiadini",
+                                      "Bojan Krkic Perez", "Vincent Janssen",
+                                      "James Morrison", "Manuel Lanzini"), 2,
+         ifelse(players_17_18$name %in% c("Olivier Giroud", "Junior Stanislas", 
+                                          "Sam Vokes", "Willian Borges Da Silva",
+                                          "Yohan Cabaye", "Ross Barkley",
+                                          "Jamie Vardy", "Jordan Henderson", "Gnegneri Yaya Toure",
+                                          "Juan Mata", "Aleksandar Mitrovic", "Dusan Tadic",
+                                          "Xherdan Shaqiri", "Bamidele Alli",
+                                          "Andy Carroll"), 3, 99)))
+players_17_18$penalties_dummy <- ifelse(players_17_18$penalties_order %in% c(1,2,3), 1, 0)
+
+players_17_18$corner_order <- 
+  ifelse(players_17_18$name %in% c("Mesut Ozil", "Junior Stanislas", "Anthony Knockaert",
+                                   "Robbie Brady", "Willian Borges Da Silva",
+                                   "Jason Puncheon", "Leighton Baines", "Chris Lowe",
+                                   "Marc Albrighton", "James Milner", "Kevin De Bruyne",
+                                   "Daley Blind", "Matt Ritchie", "James Ward-Prowse",
+                                   "Joe Allen", "Gylfi Sigurdsson", "Christian Eriksen",
+                                   "Ben Watson", "Matt Phillips", "Manuel Lanzini"), 1, 
+      ifelse(players_17_18$name %in% c("Santiago Cazorla", "Charlie Daniels", "Pascal Gross",
+                                       "Scott Arfield", "Cesc Fabregas",
+                                       "Yohan Cabaye", "Wayne Rooney", "Aaron Mooy",
+                                       "Christian Fuchs", "Jordan Henderson", "David Silva",
+                                       "Juan Mata", "Jonjo Shelvey", "Dusan Tadic",
+                                       "Xherdan Shaqiri", "Tom Carroll", "Erik Lamela",
+                                       "Etienne Capoue", "Chris Brunt", "Marko Arnautovic"), 2,
+          ifelse(players_17_18$name %in% c("Alexis Sanchez", "Ryan Fraser", "Jiri Skalak",
+                                           "Johann Berg Gudmundsson", "Pedro Rodriguez Ledesma",
+                                           "Patrick van Aanholt", "Ross Barkley", "Tom Ince",
+                                           "Daniel Drinkwater", "Philippe Coutinho", "Raheem Sterling",
+                                           "Ander Herrera", "Steven Davis",
+                                           "Charlie Adam", "Wayne Routledge", "Heung-Min Son",
+                                           "Jose Holebas", "James Morrison", "Robert Snodgrass"), 3, 99)))
+players_17_18$corner_dummy <- ifelse(players_17_18$corner_order %in% c(1,2,3), 1, 0)
+```
+
+Add in positions and team
+```{r, echo=FALSE, message=FALSE}
+positions_17_18 <- fread("Data/2017-18/players_raw.csv") %>%
+  mutate(name = paste(first_name, second_name)) %>%
+  mutate(name = sub("^\\d+|\\d+$", "", name)) %>%
+  mutate(name = stri_trans_general(name,"Latin-ASCII"))   %>%
+  mutate(position = recode(element_type, `1` = "GK", `2` = "DEF", `3` = "MID", `4` = "FWD")) %>%
+  select(name, position, team) 
+players_17_18 <- left_join(players_17_18, positions_17_18, by = "name") %>%
+  mutate(season = "17-18")
+rm(positions_17_18)
+```
+
+
+
+Pull in a database of every player from 2016/17 
+```{r, echo=FALSE, message=FALSE}
+###Loop through all player data
+parent_folder <- "Data/2016-17/players"
+sub_folders <- list.dirs(parent_folder, recursive=TRUE)[-1]
+players_16_17 <- tibble()
+for(i in sub_folders){
+  data <- read_csv(paste(i,"/gw.csv",sep = ""))
+  data$name = sub('Data/2016-17/players/',"",i)
+  data$name = sub("^\\d+|\\d+$", "",data$name)
+  data$name = stri_trans_general(data$name,"Latin-ASCII")
+  data$name <- gsub("_", " ", data$name)
+  players_16_17 <- rbind(players_16_17,data)
+}
+rm(data, parent_folder, sub_folders)
+```
+
+Add in stats for set piece takers (https://www.transfermarkt.com/premier-league/elfmeterschuetzen/wettbewerb/GB1/saison_id/2016 and https://www.premierleague.com/stats/top/players/corner_taken)
+```{r, echo=FALSE, message=FALSE}
+players_16_17$penalties_order <-
+  ifelse(players_16_17$name %in% c("Riyad Mahrez", "Alexis Sanchez", "Harry Kane",
+                                   "Sergio Aguero", "Zlatan Ibrahimovic", "Charlie Austin",
+                                   "Manuel Lanzini", "James Milner", "Bojan Krkic", "Eden Hazard",
+                                   "Leighton Baines", "Gylfi Sigurdsson", "Troy Deeney", "Nacer Chadli",
+                                   "Christian Benteke", "Callum Wilson", "Jermain Defoe", "Sam Vokes",
+                                   "Alvaro Negredo", "Robert Snodgrass"), 1,
+     ifelse(players_16_17$name %in% c("Islam Slimani", "Santiago Cazorla", "Vincent Janssen",
+                                      "Gnegneri Yaya Toure", "Wayne Rooney", "Dusan Tadic",
+                                      "Mark Noble", "Jonathan Walters", "Diego Da Silva Costa",
+                                      "Romelu Lukaku",
+                                      "Luka Milivojevic", "Joshua King", "Ashley Barnes",
+                                      "Tom Huddlestone"), 2,
+         ifelse(players_16_17$name %in% c("Theo Walcott", "Bamidele Alli",
+                                          "Gabriel Fernando de Jesus", "Shane Long",
+                                          "Charlie Adam",
+                                          "Yohan Cabaye", "Junior Stanislas", "Andre Gray"), 3, 99)))
+players_16_17$penalties_dummy <- ifelse(players_16_17$penalties_order %in% c(1,2,3), 1, 0)
+
+players_16_17$corner_order <- 
+  ifelse(players_16_17$name %in% c("Mesut Ozil", "Ryan Fraser", "Scott Arfield", "Cesc Fabregas",
+                                   "Jason Puncheon", "Kevin Mirallas", "Robert Snodgrass", "Marc Albrighton",
+                                   "Philippe Coutinho", "Kevin De Bruyne", "Wayne Rooney", "Stewart Downing",
+                                   "James Ward-Prowse", "Xherdan Shaqiri", "Sebastian Larsson", "Gylfi Sigurdsson",
+                                   "Christian Eriksen", "Jose Holebas", "Chris Brunt", "Dimitri Payet"), 1, 
+      ifelse(players_16_17$name %in% c("Santiago Cazorla", "Junior Stanislas", "Steven Defour", 
+                                       "Willian Borges Da Silva",
+                                       "Yohan Cabaye", "Ross Barkley", "Kamil Grosicki", "Riyad Mahrez",
+                                       "James Milner", "David Silva", "Juan Mata", "Gaston Ramirez",
+                                       "Dusan Tadic", "Charlie Adam", "Adnan Januzaj", "Jefferson Montero",
+                                       "Heung-Min Son", "Tom Cleverley", "Matt Phillips", "Manuel Lanzini"), 2,
+          ifelse(players_16_17$name %in% c("Granit Xhaka", "Simon Francis", "Johann Berg Gudmundsson", "Eden Hazard",
+                                           "Andros Townsend", "Leighton Baines", "Sam Clucas", "Demarai Gray",
+                                           "Jordan Henderson", "Leroy Sane", "Daley Blind", "Adam Forshaw",
+                                           "Steven Davis", "Joe Allen", "Wahbi Khazri", "Sung-yueng Ki",
+                                           "Erik Lamela", "Etienne Capoue", "Nacer Chadli", "Robert Snodgrass"), 3,
+                 99)))
+players_16_17$corner_dummy <- ifelse(players_16_17$corner_order %in% c(1,2,3), 1, 0)
+```
+
+Add in positions and team
+```{r, echo=FALSE, message=FALSE}
+positions_16_17 <- fread("Data/2016-17/players_raw.csv") %>%
+  mutate(name = paste(first_name, second_name)) %>%
+  mutate(name = sub("^\\d+|\\d+$", "", name)) %>%
+  mutate(name = stri_trans_general(name,"Latin-ASCII"))   %>%
+  mutate(position = recode(element_type, `1` = "GK", `2` = "DEF", `3` = "MID", `4` = "FWD")) %>%
+  select(name, position, team) 
+players_16_17 <- left_join(players_16_17, positions_16_17, by = "name") %>%
+  mutate(season = "16-17")
+rm(positions_16_17)
+```
+
+
+
+
+####################################################################################
+#Chapter 3: Add in data from elo, join all together, and save
+####################################################################################
+
+
+Add in elo
+```{r, echo=FALSE, message=FALSE}
+#Create list of teams and empty list for results
+teams <- c("arsenal", "astonvilla", "bournemouth", "brighton", "burnley", "cardiff",
+           "chelsea", "crystalpalace", "everton", "fulham", "huddersfield", "hull", 
+           "leeds", "leicester", "liverpool", "middlesbrough", 
+           "mancity", "manunited", "newcastle", "norwich", "sheffieldunited",
+           "southampton", "stoke", "sunderland", "swansea", "tottenham", 
+           "watford", "westbrom", "westham", "wolves")
+elo_data <- tibble()
+for(i in teams){
+  print(i)
+  team_data <- read_csv(paste0("http://api.clubelo.com/", i))
+  #Convert to daily and only after 2010
+  team_data <- team_data %>%
+    filter(From >= as.Date("2010/01/01")) %>%
+    mutate(number_days = as.numeric(To - From + 1)) %>%
+    uncount(number_days, .id = "days_from_to") %>%
+    mutate(Date = From + days_from_to - 1) %>%
+    select(Club, Date, Elo)
+  elo_data <- rbind(elo_data,team_data)
+  rm(team_data)
+}
+rm(teams, i)
+```
+
+
+Merge the team and elo datasets for each year. Have to do manually, and the codes change each year
+Do for 20-21
+```{r, echo=FALSE}
+#Make team codes into names
+players_20_21 <- players_20_21 %>%
+  mutate(team_a = recode(team_a, `1` = "Arsenal", `2` = "Aston Villa", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Chelsea", `6` = "Crystal Palace", `7` = "Everton", `8` = "Fulham", 
+                         `9` = "Leicester", `10` = "Leeds",
+                         `11` = "Liverpool", `12` = "Man City", `13` = "Man United", 
+                         `14` = "Newcastle", `15` = "Sheffield United", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "West Brom", `19` = "West Ham", `20` = "Wolves"),
+         team_h = recode(team_h, `1` = "Arsenal", `2` = "Aston Villa", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Chelsea", `6` = "Crystal Palace", `7` = "Everton", `8` = "Fulham", 
+                         `9` = "Leicester", `10` = "Leeds",
+                         `11` = "Liverpool", `12` = "Man City", `13` = "Man United", 
+                         `14` = "Newcastle", `15` = "Sheffield United", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "West Brom", `19` = "West Ham", `20` = "Wolves"))
+#Create new variable for Date (day before game)
+players_20_21$Date <- as.Date(players_20_21$kickoff_time.y) - 1
+#Merge for home and away
+players_20_21 <- left_join(players_20_21, elo_data %>% rename("team_a" = "Club"), by = c("team_a", "Date")) %>%
+  rename("elo_team_a" = "Elo")
+players_20_21 <- left_join(players_20_21, elo_data %>% rename("team_h" = "Club"), by = c("team_h", "Date")) %>%
+  rename("elo_team_h" = "Elo")
+```
+
+
+Merge the team and elo datasets for each year. Have to do manually, and the codes change each year
+Do for 19-20
+```{r, echo=FALSE}
+#Make team codes into names
+players_19_20 <- players_19_20 %>%
+  mutate(team_a = recode(team_a, `1` = "Arsenal", `2` = "Aston Villa", `3` = "Bournemouth", `4` = "Brighton", 
+                         `5` = "Burnley", `6` = "Chelsea", `7` = "Crystal Palace", `8` = "Everton", 
+                         `9` = "Leicester",`10` = "Liverpool", `11` = "Man City", `12` = "Man United", 
+                         `13` = "Newcastle", `14` = "Norwich", `15` = "Sheffield United", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Ham", `20` = "Wolves"),
+         team_h = recode(team_h, `1` = "Arsenal", `2` = "Aston Villa", `3` = "Bournemouth", `4` = "Brighton", 
+                         `5` = "Burnley", `6` = "Chelsea", `7` = "Crystal Palace", `8` = "Everton", 
+                         `9` = "Leicester",`10` = "Liverpool", `11` = "Man City", `12` = "Man United", 
+                         `13` = "Newcastle", `14` = "Norwich", `15` = "Sheffield United", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Ham", `20` = "Wolves"))
+#Create new variable for Date (day before game)
+players_19_20$Date <- as.Date(players_19_20$kickoff_time.y) - 1
+#Merge for home and away
+players_19_20 <- left_join(players_19_20, elo_data %>% rename("team_a" = "Club"), by = c("team_a", "Date")) %>%
+  rename("elo_team_a" = "Elo")
+players_19_20 <- left_join(players_19_20, elo_data %>% rename("team_h" = "Club"), by = c("team_h", "Date")) %>%
+  rename("elo_team_h" = "Elo")
+```
+
+Merge the team and elo datasets for each year. Have to do manually, and the codes change each year
+Do for 18-19
+```{r, echo=FALSE}
+#Make team codes into names
+players_18_19 <- players_18_19 %>%
+  mutate(team_a = recode(team_a, `1` = "Arsenal", `2` = "Bournemouth", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Cardiff", `6` = "Chelsea", `7` = "Crystal Palace", `8` = "Everton", 
+                         `9` = "Fulham", `10` = "Huddersfield", `11` = "Leicester",`12` = "Liverpool", 
+                         `13` = "Man City", `14` = "Man United", `15` = "Newcastle", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Ham", `20` = "Wolves"),
+         team_h = recode(team_h, `1` = "Arsenal", `2` = "Bournemouth", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Cardiff", `6` = "Chelsea", `7` = "Crystal Palace", `8` = "Everton", 
+                         `9` = "Fulham", `10` = "Huddersfield", `11` = "Leicester",`12` = "Liverpool", 
+                         `13` = "Man City", `14` = "Man United", `15` = "Newcastle", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Ham", `20` = "Wolves"))
+#Create new variable for Date (day before game)
+players_18_19$Date <- as.Date(players_18_19$kickoff_time.y) - 1
+#Merge for home and away
+players_18_19 <- left_join(players_18_19, elo_data %>% rename("team_a" = "Club"), by = c("team_a", "Date")) %>%
+  rename("elo_team_a" = "Elo")
+players_18_19 <- left_join(players_18_19, elo_data %>% rename("team_h" = "Club"), by = c("team_h", "Date")) %>%
+  rename("elo_team_h" = "Elo")
+```
+
+Merge the team and elo datasets for each year. Have to do manually, and the codes change each year
+Do for 17-18
+```{r, echo=FALSE}
+#Make team codes into names
+players_17_18 <- players_17_18 %>%
+  mutate(team_a = recode(opponent_team, `1` = "Arsenal", `2` = "Bournemouth", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Chelsea", `6` = "Crystal Palace", `7` = "Everton", `8` = "Huddersfield", 
+                         `9` = "Leicester", `10` = "Liverpool", `11` = "Man City",`12` = "Man United", 
+                         `13` = "Newcastle", `14` = "Southampton", `15` = "Stoke", `16` = "Swansea",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Brom", `20` = "West Ham"),
+         team_h = recode(team, `1` = "Arsenal", `2` = "Bournemouth", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Chelsea", `6` = "Crystal Palace", `7` = "Everton", `8` = "Huddersfield", 
+                         `9` = "Leicester", `10` = "Liverpool", `11` = "Man City",`12` = "Man United", 
+                         `13` = "Newcastle", `14` = "Southampton", `15` = "Stoke", `16` = "Swansea",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Brom", `20` = "West Ham"))
+#Create new variable for Date (day before game)
+players_17_18$Date <- as.Date(players_17_18$kickoff_time) - 1
+#Merge for home and away
+players_17_18 <- left_join(players_17_18, elo_data %>% rename("team_a" = "Club"), by = c("team_a", "Date")) %>%
+  rename("elo_team_a" = "Elo")
+players_17_18 <- left_join(players_17_18, elo_data %>% rename("team_h" = "Club"), by = c("team_h", "Date")) %>%
+  rename("elo_team_h" = "Elo")
+```
+
+
+Merge the team and elo datasets for each year. Have to do manually, and the codes change each year
+Do for 16-17
+```{r, echo=FALSE}
+#Make team codes into names
+players_16_17 <- players_16_17 %>%
+  mutate(team_a = recode(opponent_team, `1` = "Arsenal", `2` = "Bournemouth", `3` = "Burnley", `4` = "Chelsea", 
+                         `5` = "Crystal Palace", `6` = "Everton", `7` = "Hull", `8` = "Leicester", 
+                         `9` = "Liverpool", `10` = "Man City", `11` = "Man United",`12` = "Middlesbrough", 
+                         `13` = "Southampton", `14` = "Stoke", `15` = "Sunderland", `16` = "Swansea",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Brom", `20` = "West Ham"),
+         team_h = recode(team, `1` = "Arsenal", `2` = "Bournemouth", `3` = "Burnley", `4` = "Chelsea", 
+                         `5` = "Crystal Palace", `6` = "Everton", `7` = "Hull", `8` = "Leicester", 
+                         `9` = "Liverpool", `10` = "Man City", `11` = "Man United",`12` = "Middlesbrough", 
+                         `13` = "Southampton", `14` = "Stoke", `15` = "Sunderland", `16` = "Swansea",
+                         `17` = "Tottenham", `18` = "Watford", `19` = "West Brom", `20` = "West Ham"))
+#Create new variable for Date (day before game)
+players_16_17$Date <- as.Date(players_16_17$kickoff_time) - 1
+#Merge for home and away
+players_16_17 <- left_join(players_16_17, elo_data %>% rename("team_a" = "Club"), by = c("team_a", "Date")) %>%
+  rename("elo_team_a" = "Elo")
+players_16_17 <- left_join(players_16_17, elo_data %>% rename("team_h" = "Club"), by = c("team_h", "Date")) %>%
+  rename("elo_team_h" = "Elo")
+```
+
+
+
+Join and clean
+```{r, echo=FALSE, message=FALSE}
+players_20_21 <- players_20_21 %>%
+  select(assists, bonus, bps, clean_sheets, creativity, goals_conceded, goals_scored, ict_index, influence, 
+       minutes.x, own_goals, penalties_missed, penalties_saved, red_cards, position,
+       round, saves, selected, team_a_score.x, team_h_score.x, threat, total_points, value, was_home, 
+       yellow_cards, name, elo_team_a, elo_team_h, season, penalties_order, penalties_dummy,
+       corner_order, corner_dummy) %>%
+  rename(minutes = minutes.x, team_a_score = team_a_score.x, team_h_score = team_h_score.x)
+players_19_20 <- players_19_20 %>%
+  select(assists, bonus, bps, clean_sheets, creativity, goals_conceded, goals_scored, ict_index, influence, 
+       minutes.x, own_goals, penalties_missed, penalties_saved, red_cards, position,
+       round, saves, selected, team_a_score.x, team_h_score.x, threat, total_points, value, was_home, 
+       yellow_cards, name, elo_team_a, elo_team_h, season, penalties_order, penalties_dummy, 
+       corner_order, corner_dummy) %>%
+  rename(minutes = minutes.x, team_a_score = team_a_score.x, team_h_score = team_h_score.x)
+players_18_19 <- players_18_19 %>%
+  select(assists, bonus, bps, clean_sheets, creativity, goals_conceded, goals_scored, ict_index, influence, 
+       minutes.x, own_goals, penalties_missed, penalties_saved, red_cards, position,
+       round, saves, selected, team_a_score.x, team_h_score.x, threat, total_points, value, was_home, 
+       yellow_cards, name, elo_team_a, elo_team_h, season, penalties_order, penalties_dummy, 
+       corner_order, corner_dummy) %>%
+  rename(minutes = minutes.x, team_a_score = team_a_score.x, team_h_score = team_h_score.x)
+players_17_18 <- players_17_18 %>%
+  select(assists, bonus, bps, clean_sheets, creativity, goals_conceded, goals_scored, ict_index, influence, 
+       minutes, own_goals, penalties_missed, penalties_saved, red_cards, position,
+       round, saves, selected, team_a_score, team_h_score, threat, total_points, value, was_home, 
+       yellow_cards, name, elo_team_a, elo_team_h, season, penalties_order, penalties_dummy, 
+       corner_order, corner_dummy) 
+players_16_17 <- players_16_17 %>%
+  select(assists, bonus, bps, clean_sheets, creativity, goals_conceded, goals_scored, ict_index, influence, 
+       minutes, own_goals, penalties_missed, penalties_saved, red_cards, position,
+       round, saves, selected, team_a_score, team_h_score, threat, total_points, value, was_home, 
+       yellow_cards, name, elo_team_a, elo_team_h, season, penalties_order, penalties_dummy, 
+       corner_order, corner_dummy) 
+players <- rbind(players_20_21, players_19_20, players_18_19, players_17_18, players_16_17) %>%
+  mutate(corner_order = as.numeric(corner_order),
+         penalties_order = as.numeric(penalties_order))
+rm(players_20_21, players_19_20, players_18_19, players_17_18, players_16_17, elo_data)
+```
+
+Save
+```{r, echo=FALSE, message=FALSE}
+saveRDS(players, "Data/Cleaned Data/Full data for modelling.rds")
+```
+
+
+
