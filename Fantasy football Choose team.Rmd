@@ -1,0 +1,455 @@
+---
+title: "Fantasy Football Choose team"
+output: html_document
+---
+
+
+STRATEGY
+Part 1: Create models at player level using data from the last few seasons
+1. Predict number of points in a game
+2. Use threat of team, threat of other team (or relative threat of team), home or away, metrics for form (potentially including rising form), metrics for likelihood to play (e.g. time in last game)
+3. Build a smaller model which only looks at team threat, ICT and cost for new people
+Part 2: Use model to create team
+1. Predict points for each of the first 5 games
+2. Choose an 11 which maximises expected points for 90k, bearing in mind potential positions. Choose the remaining 5 similarly
+
+
+
+
+####################################################################################
+#Chapter 1: Setting up the script
+####################################################################################
+
+
+Clear Everything from memory 
+```{r, echo=FALSE}
+rm(list=ls())
+```
+
+Set wd, install packages and disable scientific notation
+```{r setup, include=FALSE, echo=FALSE}
+# Set up working directory
+path <- paste("/Users/louisgraham/Dropbox/Fantasy Football")
+knitr::opts_knit$set(root.dir = normalizePath(path))
+
+# Prevent scientific notation
+knitr::opts_knit$set(options(scipen=999))
+
+# Install and load all the packages that will be used for analysis
+pkgs <- c("caret", 'caretEnsemble', "tidyverse", "lubridate", "data.table", "dplyr", "readxl", "ggplot2",
+          "stringi", "adagio", "lpSolve", 'httr', 'jsonlite')
+
+miss_pkgs <- pkgs[!pkgs %in% installed.packages()[,1]] # vector of missing packages
+if(length(miss_pkgs)>0){
+  install.packages(miss_pkgs)
+}
+invisible(lapply(pkgs,library,character.only=TRUE))
+
+# Clear our memory by removing objects that are no longer needed.
+rm(miss_pkgs, pkgs, path)
+```
+
+####################################################################################
+#Chapter 2: Prepare the dataframe looking 5 games ahead
+####################################################################################
+
+
+Open current players, fixtures, and historical players data
+```{r, echo=FALSE, message=FALSE}
+players_current <- readRDS("Cleaned Data/Current players.rds")
+fixtures <- readRDS("Cleaned Data/All fixtures.rds")
+players_historical <- readRDS("Cleaned Data/Players historical data.rds")
+```
+
+Keep only the variables needed for the modelling
+```{r, echo=FALSE}
+players_historical <- players_historical %>%
+  select(minutes, round, total_points, value, name, season, ict_index, position,
+         penalties_order, penalties_dummy, corner_order, corner_dummy)
+```
+
+For minutes, ict_index, total_points and value, take lagged 
+```{r, echo=FALSE}
+players_historical <- players_historical %>%
+  #Make season a number
+  mutate(season = as.numeric(substr(season, 1, 2))) %>%
+  #Group by player, and arrange by season and round
+  group_by(name) %>%
+  arrange(season, round) %>%
+  #Take lagged variables (bear in mind that the current is actually the first lag for the next game)
+  mutate(minutes_lag1 = minutes, minutes_lag2 = lag(minutes,1),
+         minutes_lag3 = lag(minutes,2), minutes_lag4 = lag(minutes,3),
+         ict_index_lag1 = ict_index, ict_index_lag2 = lag(ict_index,1),
+         ict_index_lag3 = lag(ict_index,2), ict_index_lag4 = lag(ict_index,3),
+         total_points_lag1 = total_points, total_points_lag2 = lag(total_points,1),
+         total_points_lag3 = lag(total_points,2), total_points_lag4 = lag(total_points,3),
+         value_lag1 = value, value_lag2 = lag(value,1),
+         value_lag3 = lag(value,2), value_lag4 = lag(value,3)) %>% ungroup() %>%
+  #Drop the variables used for construction
+  select(-minutes, -total_points, -value, -ict_index)
+```
+
+Clean and keep only the last row
+```{r, echo=FALSE}
+players_historical <- players_historical %>%
+  group_by(name) %>%
+  arrange(season, round) %>%
+  #Keep the last row
+  filter(row_number() == max(row_number())) %>% ungroup() %>%
+  #Drop date variables
+  select(-season, -round)
+```
+
+Merge players and historical players
+```{r, echo=FALSE}
+players <- left_join(players_current, players_historical, by = "name") 
+rm(players_current, players_historical)
+```
+
+Merge with the fixtures data
+```{r, echo=FALSE, message=FALSE}
+players_away <- left_join(players, fixtures, by = c("team" = "team_a"))
+players_away <- players_away %>%
+  rename(own_team_difficulty = elo_team_a, 
+         other_team_difficulty = elo_team_h) %>%
+  mutate(home = 0) %>%
+  select(-team_h)
+players_home <- left_join(players, fixtures, by = c("team" = "team_h"))
+players_home <- players_home %>%
+  rename(own_team_difficulty = elo_team_h, 
+         other_team_difficulty = elo_team_a) %>%
+  mutate(home = 1) %>%
+  select(-team_a)
+players <- rbind(players_home, players_away) 
+rm(players_home, players_away, fixtures)
+```
+
+Add data for the quarter of the season
+```{r, echo=FALSE}
+players <- players %>%
+  mutate(quarter = ifelse(event <= 10, "first",
+                          ifelse(event <= 19, "second",
+                                 ifelse(event <= 29, "third", "fourth"))))
+```
+
+Calculate relative difficulty
+```{r, echo=FALSE}
+players$relative_difficulty <-  players$other_team_difficulty/players$own_team_difficulty
+```
+
+Adjust value, selected and ict variables
+```{r, echo=FALSE, message=FALSE}
+players <- players %>%
+  mutate(value_change4 = 100*(now_cost - value_lag4)/now_cost,
+         value_change3 = 100*(now_cost - value_lag3)/now_cost,
+         value_change2 = 100*(now_cost - value_lag2)/now_cost,
+         value_change1 = 100*(now_cost - value_lag1)/now_cost,
+         selected = selected_by_percent/max(selected_by_percent),
+         ict_index_lag1 = ict_index_lag1/max(ict_index_lag1, na.rm=T),
+         ict_index_lag2 = ict_index_lag2/max(ict_index_lag2, na.rm=T),
+         ict_index_lag3 = ict_index_lag3/max(ict_index_lag3, na.rm=T),
+         ict_index_lag4 = ict_index_lag4/max(ict_index_lag4, na.rm=T),
+         value = now_cost/max(now_cost)) %>%
+  select(c(-selected_by_percent, -value_lag4, -value_lag3, -value_lag2, -value_lag1, -ict_index))
+```
+
+Shift name first
+```{r, echo=FALSE, message=FALSE}
+players <- players %>%
+  select(name, everything())
+```
+
+
+####################################################################################
+#Chapter 3: Make predictions
+####################################################################################
+
+Load in the models
+```{r, echo=FALSE}
+model_4_lag <- readRDS("Models/Lasso_Ridge_Model_lag4.Rds")
+model_3_lag <- readRDS("Models/Lasso_Ridge_Model_lag3.Rds")
+model_2_lag <- readRDS("Models/Lasso_Ridge_Model_lag2.Rds")
+model_1_lag <- readRDS("Models/Lasso_Ridge_Model_lag1.Rds")
+model_no_lag <- readRDS("Models/Lasso_Ridge_Model_No_Lag.Rds")
+```
+
+Run all models for as many people as possible, and choose 4lag, then 1lag, then nolag
+```{r, echo=FALSE}
+#Run 4lag
+players$points_predicted_4_lag <- predict(model_4_lag, newdata = players, na.action = NULL)
+#Run 3lag
+players$points_predicted_3_lag <- predict(model_3_lag, newdata = players, na.action = NULL)
+#Run 2lag
+players$points_predicted_2_lag <- predict(model_2_lag, newdata = players, na.action = NULL)
+#Run 1lag
+players$points_predicted_1_lag <- predict(model_1_lag, newdata = players, na.action = NULL)   
+#Run nolag
+players$points_predicted_no_lag <- predict(model_no_lag, newdata = players, na.action = NULL)   
+#Create points
+players$points_predicted <- 
+  ifelse(!is.na(players$points_predicted_4_lag), players$points_predicted_4_lag,
+         ifelse(!is.na(players$points_predicted_3_lag), players$points_predicted_3_lag,
+                ifelse(!is.na(players$points_predicted_2_lag), players$points_predicted_2_lag,
+                       ifelse(!is.na(players$points_predicted_1_lag), players$points_predicted_1_lag,
+                              players$points_predicted_no_lag))))
+#Remove intermediate vars and models
+players <- players %>%
+  select(-points_predicted_4_lag, -points_predicted_3_lag, -points_predicted_2_lag, 
+         -points_predicted_1_lag, -points_predicted_no_lag)
+rm(model_4_lag, model_3_lag, model_2_lag, model_1_lag, model_no_lag)
+```
+
+Keep only the first five games
+```{r, echo=FALSE}
+players <- players %>%
+  group_by(name) %>%
+  arrange(kickoff_time) %>%
+  filter(kickoff_time > as.Date(Sys.Date())) %>%
+  filter(row_number() <= 5) %>% ungroup()
+```
+
+Take a weighted average of the first 5 games
+```{r, echo=FALSE}
+players <- players %>%
+  group_by(name) %>%
+  arrange(kickoff_time) %>%
+  #Add in weight depending on how far away the game is (declining with time)
+  mutate(weight = ifelse(row_number() == 1, 0.35, 
+                         ifelse(row_number() == 2, 0.25,
+                               ifelse(row_number() == 3, 0.2,
+                                     ifelse(row_number() == 4, 0.12, 0.08))))) %>%
+  #Create a weighted final points
+  mutate(weighted_points = points_predicted * weight) %>%
+  mutate(final_points = sum(weighted_points)) %>%
+  #Keep one row only (this now gives a summary of expected points for the next games)
+  filter(row_number() == 1) %>% ungroup() %>%
+  #Rename the points predicted variable, as this is for the next game only. Note that several other variables are also for the next game. Keep these for visibility
+  rename(points_predicted_next_game = points_predicted) %>%
+  select(-weight, -weighted_points)
+```
+
+
+####################################################################################
+#Chapter 5: Check current team
+####################################################################################
+
+Previous team (UPDATE THIS)
+```{r, echo=FALSE}
+previous_team <- data.frame(name = c("Emiliano Martinez", 
+                                     "Kurt Zouma", "Ben Mee", "Benjamin Chilwell",
+                                     "Jack Grealish",  "Bruno Miguel Borges Fernandes", "James Ward-Prowse", 
+                                     "Heung-Min Son", 
+                                     "Dominic Calvert-Lewin", "Harry Kane", "Patrick Bamford",
+                                     "Alex McCarthy", "James Justin", "Vladimir Coufal", "Anwar El Ghazi"), 
+                            first_11 = c(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0))
+```
+
+Merge team with the players data
+```{r, echo=FALSE}
+previous_team <- left_join(previous_team, players, by = "name")
+```
+
+Calculate best current 11 (at least 1 GK, 3 defenders and 1 forward)
+```{r, echo=FALSE}
+#Create objective function
+objective.in <- previous_team$final_points
+#Create matrix for requirements
+const <- t(as.matrix(tibble(goal_keeper = ifelse(previous_team$position == "GK", 1, 0),
+                            defender = ifelse(previous_team$position == "DEF", 1, 0),
+                            midfield = ifelse(previous_team$position == "MID", 1, 0),
+                            striker = ifelse(previous_team$position == "FWD", 1, 0),
+                            ones = rep(1, nrow(previous_team)))))
+#Create right hand side and inequality
+rhs <- c(1, 3, 0, 1, 11)
+direction  <- c("==", ">=", ">=", ">=", "==")
+#Run, and make the team
+optimum <-  lp(direction="max",  objective.in, const, direction,  rhs, all.bin = TRUE)
+previous_team$first_11_new <- ifelse(optimum$solution==1, 1, 0)
+rm(objective.in, const, rhs, direction, optimum)
+```
+
+Check expected statistics for current team
+```{r, echo=FALSE}
+sum(previous_team[previous_team$first_11_new == 1,]$now_cost)
+sum(previous_team$now_cost)
+sum(previous_team[previous_team$first_11_new == 1,]$final_points) + 
+  max(previous_team[previous_team$first_11_new == 1,]$final_points)
+```
+
+####################################################################################
+#Chapter 6: Select optimal team changes
+####################################################################################
+
+Amount left over (UPDATE THIS)
+```{r, echo=FALSE}
+amount_left_over <- 0
+```
+
+Rank potential switches. Loop through each player, and see the best person they could be transferred for given the cost and the requirement for team shape
+```{r, echo=FALSE}
+#Calculate number in each position. Don't go below 2 goalkeepers, 4 defenders and 2 strikers
+number_by_position <- previous_team %>%
+  group_by(position) %>%
+  summarise(number = n())
+#Loop through each player in the squad
+switch <- data.frame(matrix(ncol = 17, nrow = 0))
+for(i in 1:nrow(previous_team)){
+  #Give details on the current player
+  switch[i,1] <- previous_team$name[i]
+  switch[i,2] <- previous_team$final_points[i]
+  switch[i,3] <- previous_team$position[i]
+  switch[i,4] <- previous_team$first_11_new[i]
+  switch[i,5] <- previous_team$now_cost[i]
+  #If a goalkeeper and there are 2 or fewer goalkeepers, has to be another goalkeeper
+  if(switch[i,3] == "GK"  & number_by_position[number_by_position$position == "GK",]$number <= 2){
+    df <- players[players$now_cost <= switch[i,5] + amount_left_over & players$position == "GK",]
+  }
+  #If a defender and there are 4 or fewer defenders, has to be another defender
+  else if(switch[i,3] == "DEF"){#}  & number_by_position[number_by_position$position == "DEF",]$number <= 4){
+    df <- players[players$now_cost <= switch[i,5] + amount_left_over & players$position == "DEF",]
+  }
+  #If a striker and there are 2 or fewer strikers, has to be another striker
+  else if(switch[i,3] == "FWD"  & number_by_position[number_by_position$position == "FWD",]$number <= 2){
+    df <- players[players$now_cost <= switch[i,5] + amount_left_over & players$position == "FWD",]
+  }
+  #Otherwise anyone
+  else{
+    df <- players[players$now_cost <= switch[i,5] + amount_left_over,]
+  }
+  #Get details on the replacement player
+  switch[i,6] = df[df$final_points == sort(df$final_points, TRUE)[1] & !is.na(df$final_points),]$name
+  switch[i,7] = df[df$final_points == sort(df$final_points, TRUE)[1]  & !is.na(df$final_points),]$final_points
+  switch[i,8] = df[df$final_points == sort(df$final_points, TRUE)[1]  & !is.na(df$final_points),]$position
+  switch[i,9] = df[df$final_points == sort(df$final_points, TRUE)[1]  & !is.na(df$final_points),]$now_cost
+  switch[i,10] = df[df$final_points == sort(df$final_points, TRUE)[2] & !is.na(df$final_points),]$name
+  switch[i,11] = df[df$final_points == sort(df$final_points, TRUE)[2]  & !is.na(df$final_points),]$final_points
+  switch[i,12] = df[df$final_points == sort(df$final_points, TRUE)[2]  & !is.na(df$final_points),]$position
+  switch[i,13] = df[df$final_points == sort(df$final_points, TRUE)[2]  & !is.na(df$final_points),]$now_cost
+  switch[i,14] = df[df$final_points == sort(df$final_points, TRUE)[3] & !is.na(df$final_points),]$name
+  switch[i,15] = df[df$final_points == sort(df$final_points, TRUE)[3]  & !is.na(df$final_points),]$final_points
+  switch[i,16] = df[df$final_points == sort(df$final_points, TRUE)[3]  & !is.na(df$final_points),]$position
+  switch[i,17] = df[df$final_points == sort(df$final_points, TRUE)[3]  & !is.na(df$final_points),]$now_cost
+}
+#Name the variables
+x <- c("current_name", "current_points", "current_position", "current_first_11", "current_now_cost",
+       "trade_name", "trade_points", "trade_position", "current_now_cost",
+       "second_trade_name", "second_trade_points", "second_trade_position", "second_current_now_cost",
+       "third_trade_name", "third_trade_points", "third_trade_position", "third_current_now_cost")
+colnames(switch) <- x
+rm(x, number_by_position, i, df)
+#Calculate point benefit
+switch$point_increase <- switch$trade_points - switch$current_points
+switch$point_increase2 <- switch$second_trade_points - switch$current_points
+switch$point_increase3 <- switch$third_trade_points - switch$current_points
+#Choose person to transfer. Only include first team people
+switch2 <- switch[switch$current_first_11 == 1,]
+transfer_out <- switch[switch2$point_increase == max(switch2$point_increase),]$current_name
+transfer_in <- switch[switch2$point_increase == max(switch2$point_increase),]$trade_name
+rm(switch2)
+```
+
+Create new squad with the best change made
+```{r, echo=FALSE}
+new_team <- data.frame(name = previous_team$name) %>%
+  filter(!name %in% transfer_out)
+new_team <- rbind(new_team, data.frame(name = transfer_in))
+new_team <- left_join(new_team, players, by = "name")
+```
+
+Create new team (at least 1 GK, 3 defenders and 1 forward)
+```{r, echo=FALSE}
+#Create objective function
+objective.in <- new_team$final_points
+#Create matrix for requirements
+const <- t(as.matrix(tibble(goal_keeper = ifelse(new_team$position == "GK", 1, 0),
+                            defender = ifelse(new_team$position == "DEF", 1, 0),
+                            midfield = ifelse(new_team$position == "MID", 1, 0),
+                            striker = ifelse(new_team$position == "FWD", 1, 0),
+                            ones = rep(1, nrow(new_team)))))
+#Create right hand side and inequality
+rhs <- c(1, 3, 0, 1, 11)
+direction  <- c("==", ">=", ">=", ">=", "==")
+#Run, and make the team
+optimum <-  lp(direction="max",  objective.in, const, direction,  rhs, all.bin = TRUE)
+new_team$first_11_new <- ifelse(optimum$solution==1, 1, 0)
+rm(objective.in, const, rhs, direction, optimum)
+```
+
+Check expected statistics for new team
+```{r, echo=FALSE}
+sum(new_team[new_team$first_11_new == 1,]$now_cost)
+sum(new_team$now_cost)
+sum(new_team[new_team$first_11_new == 1,]$final_points) + 
+  max(new_team[new_team$first_11_new == 1,]$final_points)
+```
+
+####################################################################################
+#Chapter 7: Select ideal team
+####################################################################################
+
+Select best 11 for total amount (1000 + amount left over) minus 200
+```{r, echo=FALSE}
+#Strip nas 
+players_2 <- players %>%
+  filter(!is.na(final_points)) 
+#Create objective function
+objective.in <- players_2$final_points
+#Create matrix for requirements
+const <- t(as.matrix(tibble(value = players_2$now_cost,
+                            goal_keeper = ifelse(players_2$position == "GK", 1, 0),
+                            defender = ifelse(players_2$position == "DEF", 1, 0),
+                            midfield = ifelse(players_2$position == "MID", 1, 0),
+                            striker = ifelse(players_2$position == "FWD", 1, 0),
+                            ones = rep(1, nrow(players_2)))))
+#Create right hand side and inequality
+rhs <- c(sum(previous_team$now_cost) - 200 + amount_left_over, 1, 3, 0, 1, 11)
+direction  <- c("<=", "==", ">=", ">=", ">=", "==")
+#Run, and make the team
+optimum <-  lp(direction="max",  objective.in, const, direction,  rhs, all.bin = TRUE)
+team_11 <- players_2[optimum$solution==1,] %>%
+  mutate(first_11 = 1)
+rm(objective.in, const, rhs, direction)
+```
+
+Select remaining 4 for the remaining balance
+```{r, echo=FALSE}
+#Remove selected players
+players_remaining <- players_2[optimum$solution==0,]
+#Create objective function
+objective.in <- players_remaining$final_points
+#Create matrix for requirements
+const <- t(as.matrix(tibble(value = players_remaining$now_cost,
+                            goal_keeper = ifelse(players_remaining$position == "GK", 1, 0),
+                            defender = ifelse(players_remaining$position == "DEF", 1, 0),
+                            midfield = ifelse(players_remaining$position == "MID", 1, 0),
+                            striker = ifelse(players_remaining$position == "FWD", 1, 0),
+                            ones = rep(1, nrow(players_remaining)))))
+#Create right hand side and inequality. Don't go below 2 goalkeepers, 4 defenders and 2 strikers
+rhs <- c(sum(previous_team$now_cost)+amount_left_over-sum(team_11$now_cost), 1, 1, 0, 0, 4)
+direction  <- c("<=", "==", ">=", ">=", ">=", "==")
+#Run, and make the team
+optimum <-  lp(direction="max",  objective.in, const, direction,  rhs, all.bin = TRUE)
+team_4 <- players_remaining[optimum$solution==1,] %>%
+  mutate(first_11 = 0)
+rm(objective.in, const, rhs, direction, players_remaining, optimum)
+```
+
+Bind together
+```{r, echo=FALSE}
+ideal_team <- rbind(team_11, team_4)
+rm(team_11, team_4)
+```
+
+Check expected statistics
+```{r, echo=FALSE}
+sum(ideal_team[ideal_team$first_11 == 1,]$now_cost)
+sum(ideal_team$now_cost)
+sum(ideal_team[ideal_team$first_11 == 1,]$final_points) + 
+  max(ideal_team[ideal_team$first_11 == 1,]$final_points)
+```
+
+
+
+
+
+

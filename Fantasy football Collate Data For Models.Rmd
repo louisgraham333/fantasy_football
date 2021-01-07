@@ -617,9 +617,62 @@ players <- rbind(players_20_21, players_19_20, players_18_19, players_17_18, pla
 rm(players_20_21, players_19_20, players_18_19, players_17_18, players_16_17, elo_data)
 ```
 
+
+Open currrent players and fixture data
+```{r, echo=FALSE, message=FALSE}
+players_currrent <- read_csv("Data/2020-21/players_raw.csv")
+fixtures <- read_csv("Data/2020-21/fixtures.csv")
+```
+
+Clean the players data
+```{r, echo=FALSE, message=FALSE}
+players_currrent <- players_currrent %>%
+  select(first_name, second_name, ict_index, selected_by_percent, now_cost, team, team_code,
+         status) %>%
+  mutate(name = paste(first_name, second_name)) %>%
+  mutate(name = stri_trans_general(name,"Latin-ASCII")) %>%
+  select(-first_name, -second_name)
+```
+
+Clean the fixtures data
+```{r, echo=FALSE, message=FALSE}
+fixtures <- fixtures %>%
+  select(event, kickoff_time, team_a, team_a_difficulty, team_h, team_h_difficulty)
+```
+
+Add ELO data into fixtures from date of running
+```{r, echo=FALSE}
+elo_data <- read_csv(paste("http://api.clubelo.com/", Sys.Date(), sep = "")) %>% 
+  filter(Club %in% c("Arsenal", "Aston Villa", "Brighton", "Burnley", "Chelsea", "Crystal Palace", "Everton", 
+                     "Fulham", "Leicester", "Leeds", "Liverpool", "Man City", "Man United", "Newcastle", 
+                     "Sheffield United", "Southampton", "Tottenham", "West Brom", "West Ham", "Wolves")) %>%
+  select(Club, Elo)
+fixtures <- fixtures %>%
+  mutate(team_a_2 = recode(team_a, `1` = "Arsenal", `2` = "Aston Villa", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Chelsea", `6` = "Crystal Palace", `7` = "Everton", `8` = "Fulham", 
+                         `9` = "Leicester", `10` = "Leeds",
+                         `11` = "Liverpool", `12` = "Man City", `13` = "Man United", 
+                         `14` = "Newcastle", `15` = "Sheffield United", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "West Brom", `19` = "West Ham", `20` = "Wolves"),
+         team_h_2 = recode(team_h, `1` = "Arsenal", `2` = "Aston Villa", `3` = "Brighton", `4` = "Burnley", 
+                         `5` = "Chelsea", `6` = "Crystal Palace", `7` = "Everton", `8` = "Fulham", 
+                         `9` = "Leicester", `10` = "Leeds",
+                         `11` = "Liverpool", `12` = "Man City", `13` = "Man United", 
+                         `14` = "Newcastle", `15` = "Sheffield United", `16` = "Southampton",
+                         `17` = "Tottenham", `18` = "West Brom", `19` = "West Ham", `20` = "Wolves"))
+fixtures <- left_join(fixtures, elo_data %>% rename("team_a_2" = "Club"), by = c("team_a_2")) %>%
+  rename("elo_team_a" = "Elo")
+fixtures <- left_join(fixtures, elo_data %>% rename("team_h_2" = "Club"), by = c("team_h_2")) %>%
+  rename("elo_team_h" = "Elo")
+fixtures <- fixtures %>%
+  select(event, kickoff_time, team_a, team_h, elo_team_a, elo_team_h)
+```
+
 Save
 ```{r, echo=FALSE, message=FALSE}
-saveRDS(players, "Data/Cleaned Data/Full data for modelling.rds")
+saveRDS(players, "Cleaned Data/Players historical data.rds")
+saveRDS(players_currrent, "Cleaned Data/Current players.rds")
+saveRDS(fixtures, "Cleaned Data/All fixtures.rds")
 ```
 
 

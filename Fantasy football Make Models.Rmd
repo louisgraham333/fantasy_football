@@ -1,0 +1,482 @@
+---
+title: "Fantasy Football Make Models"
+output: html_document
+---
+
+
+####################################################################################
+#Chapter 1: Setting up the script
+####################################################################################
+
+
+Clear Everything from memory 
+```{r, echo=FALSE}
+rm(list=ls())
+```
+
+Set wd, install packages and disable scientific notation
+```{r setup, include=FALSE, echo=FALSE}
+# Set up working directory
+path <- paste("/Users/louisgraham/Dropbox/Fantasy Football")
+knitr::opts_knit$set(root.dir = normalizePath(path))
+
+# Prevent scientific notation
+knitr::opts_knit$set(options(scipen=999))
+
+# Install and load all the packages that will be used for analysis
+pkgs <- c("caret", 'caretEnsemble', "tidyverse", "lubridate", "data.table", "dplyr", "readxl", "ggplot2",
+          "stringi", "adagio", "lpSolve")
+
+miss_pkgs <- pkgs[!pkgs %in% installed.packages()[,1]] # vector of missing packages
+if(length(miss_pkgs)>0){
+  install.packages(miss_pkgs)
+}
+invisible(lapply(pkgs,library,character.only=TRUE))
+
+# Clear our memory by removing objects that are no longer needed.
+rm(miss_pkgs, pkgs, path)
+```
+
+
+Open data 
+```{r, echo=FALSE, message=FALSE}
+players_for_prediction <- readRDS("Data/Cleaned Data/Players historical data.rds")
+```
+
+####################################################################################
+#Chapter 2: Clean into databases for prediction
+####################################################################################
+
+Add data for the quarter of the season
+```{r, echo=FALSE}
+players_for_prediction <- players_for_prediction %>%
+  mutate(quarter = ifelse(round <= 10, "first",
+                          ifelse(round <= 19, "second",
+                                 ifelse(round <= 29, "third", "fourth"))))
+```
+
+Calculate own team, other team and relative difficulty
+```{r, echo=FALSE}
+players_for_prediction <- players_for_prediction %>%
+  mutate(own_team_difficulty = ifelse(season %in% c("18-19", "19-20", "20-21"), ifelse(was_home == TRUE, 
+                                                                                       elo_team_h, elo_team_a),
+                                      elo_team_h),
+         other_team_difficulty = ifelse(season %in% c("18-19", "19-20", "20-21"), ifelse(was_home == TRUE,
+                                                                                         elo_team_a, elo_team_h),
+                                        elo_team_a)) %>%
+  mutate(relative_difficulty = other_team_difficulty/own_team_difficulty)
+```
+
+Clean home or away
+```{r, echo=FALSE}
+players_for_prediction <- players_for_prediction %>%
+  mutate(home = ifelse(was_home == TRUE, 1, 0))
+```
+
+Keep only the variables needed
+```{r, echo=FALSE}
+players_for_prediction <- players_for_prediction %>%
+  select(ict_index, minutes, round, quarter, selected, total_points, value, name, season,
+         relative_difficulty, home, penalties_order, penalties_dummy, 
+         corner_order, corner_dummy, position)
+```
+
+Change selected, ict and value into relative amount (e.g. 0 for least selected, 1 for most) for that round
+```{r, echo=FALSE}
+players_for_prediction <- players_for_prediction %>%
+  group_by(season, round) %>%
+  mutate(selected = selected/max(selected),
+         ict_index = ict_index/max(ict_index),
+         value = value/max(value)) %>% ungroup()
+```
+
+For minutes, total_points, ICT index and value, take lagged
+```{r, echo=FALSE}
+players_for_prediction <- players_for_prediction %>%
+  #Make season a number
+  mutate(season = as.numeric(substr(season, 1, 2))) %>%
+  #Group by player, and arrange by season and round
+  group_by(name) %>%
+  arrange(season, round) %>%
+  #Take lagged variables
+  mutate(minutes_lag1 = lag(minutes,1), minutes_lag2 = lag(minutes,2),
+         minutes_lag3 = lag(minutes,3), minutes_lag4 = lag(minutes,4),
+         minutes_lag5 = lag(minutes,5), minutes_lag6 = lag(minutes,6),
+         ict_index_lag1 = lag(ict_index,1), ict_index_lag2 = lag(ict_index,2),
+         ict_index_lag3 = lag(ict_index,3), ict_index_lag4 = lag(ict_index,4),
+         ict_index_lag5 = lag(ict_index,5), ict_index_lag6 = lag(ict_index,6),
+         total_points_lag1 = lag(total_points,1), total_points_lag2 = lag(total_points,2),
+         total_points_lag3 = lag(total_points,3), total_points_lag4 = lag(total_points,4),
+         total_points_lag5 = lag(total_points,5), total_points_lag6 = lag(total_points,6),
+         value_lag1 = lag(value,1), value_lag2 = lag(value,2),
+         value_lag3 = lag(value,3), value_lag4 = lag(value,4),
+         value_lag5 = lag(value,5), value_lag6 = lag(value,6)) %>%
+  mutate(value_change1 = 100*(value - value_lag1)/value,
+         value_change2 = 100*(value - value_lag2)/value,
+         value_change3 = 100*(value - value_lag3)/value,
+         value_change4 = 100*(value - value_lag4)/value,
+         value_change5 = 100*(value - value_lag5)/value,
+         value_change6 = 100*(value - value_lag6)/value) %>% ungroup()
+```
+
+Remove first few games in a season
+```{r, echo=FALSE}
+players_for_prediction <- players_for_prediction %>%
+  filter(round > 6)
+```
+
+Prep for modelling
+```{r, echo=FALSE}
+myControl <- trainControl(
+  method = "repeatedcv", number=5, repeats=1,
+  classProbs = FALSE, 
+  verboseIter = FALSE,
+  savePredictions = TRUE, 
+  trim = TRUE
+)
+seed_object <- 3734
+```
+
+####################################################################################
+#Chapter 3: Run prediction model for 6 lag
+####################################################################################
+
+Create dataset with skipped rows, and create model
+```{r, echo=FALSE}
+#Model
+formula_lag6 <- as.formula(total_points ~ selected + relative_difficulty + home + 
+                        minutes_lag1 + minutes_lag2 + minutes_lag3 +
+                        minutes_lag4 + minutes_lag5 + minutes_lag6 +
+                        ict_index_lag1 + ict_index_lag2 + ict_index_lag3 +
+                        ict_index_lag4 + ict_index_lag5 + ict_index_lag6 +
+                        total_points_lag1 + total_points_lag2 + total_points_lag3 +
+                        total_points_lag4 + total_points_lag5 + total_points_lag6 +
+                        value + value_change6 + penalties_dummy +
+                        penalties_order*penalties_dummy + corner_dummy + corner_order*corner_dummy +
+                        position + quarter)
+#Model
+tune_grid <- expand.grid(alpha = seq(0.99, 1, by = 0.005), lambda = seq(0, 0.1, by = 0.0025))
+set.seed(seed_object)
+model_glmnet_lag6 <- train(
+  formula_lag6, data = players_for_prediction,
+  metric = "RMSE",
+  method = "glmnet",
+  tuneGrid = tune_grid,
+  trControl = myControl,
+  na.action = na.omit
+)
+print(model_glmnet_lag6$bestTune)
+rm(formula_lag6, tune_grid)
+```
+
+####################################################################################
+#Chapter 4: Run prediction model for 5 lag
+####################################################################################
+
+Create dataset with skipped rows, and create model
+```{r, echo=FALSE}
+#Model
+formula_lag5 <- as.formula(total_points ~ selected + relative_difficulty + home + 
+                        minutes_lag1 + minutes_lag2 + minutes_lag3 +
+                        minutes_lag4 + minutes_lag5 +
+                        ict_index_lag1 + ict_index_lag2 + ict_index_lag3 +
+                        ict_index_lag4 + ict_index_lag5 +
+                        total_points_lag1 + total_points_lag2 + total_points_lag3 +
+                        total_points_lag4 + total_points_lag5 +
+                        value + value_change5 + penalties_dummy +
+                        penalties_order*penalties_dummy + corner_dummy + corner_order*corner_dummy +
+                        position + quarter)
+#Model
+tune_grid <- expand.grid(alpha = seq(0.99, 1, by = 0.005), lambda = seq(0, 0.1, by = 0.0025))
+set.seed(seed_object)
+model_glmnet_lag5 <- train(
+  formula_lag5, data = players_for_prediction,
+  metric = "RMSE",
+  method = "glmnet",
+  tuneGrid = tune_grid,
+  trControl = myControl,
+  na.action = na.omit
+)
+print(model_glmnet_lag5$bestTune)
+rm(formula_lag5, tune_grid)
+```
+
+####################################################################################
+#Chapter 5: Run prediction model for 4 lag
+####################################################################################
+
+Create dataset with skipped rows, and create model
+```{r, echo=FALSE}
+#Model
+formula_lag4 <- as.formula(total_points ~ selected + relative_difficulty + home + 
+                        minutes_lag1 + minutes_lag2 + minutes_lag3 +
+                        minutes_lag4 +
+                        ict_index_lag1 + ict_index_lag2 + ict_index_lag3 +
+                        ict_index_lag4 +
+                        total_points_lag1 + total_points_lag2 + total_points_lag3 +
+                        total_points_lag4 +
+                        value + value_change4 + penalties_dummy +
+                        penalties_order*penalties_dummy + corner_dummy + corner_order*corner_dummy  +
+                        position + quarter)
+#Model
+tune_grid <- expand.grid(alpha = seq(0.99, 1, by = 0.005), lambda = seq(0, 0.1, by = 0.0025))
+set.seed(seed_object)
+model_glmnet_lag4 <- train(
+  formula_lag4, data = players_for_prediction,
+  metric = "RMSE",
+  method = "glmnet",
+  tuneGrid = tune_grid,
+  trControl = myControl,
+  na.action = na.omit
+)
+print(model_glmnet_lag4$bestTune)
+rm(formula_lag4, tune_grid)
+```
+
+####################################################################################
+#Chapter 6: Run prediction model for 3 lag
+####################################################################################
+
+Create dataset with skipped rows, and create model
+```{r, echo=FALSE}
+#Model
+formula_lag3 <- as.formula(total_points ~ selected + relative_difficulty + home + 
+                        minutes_lag1 + minutes_lag2 + minutes_lag3 +
+                        ict_index_lag1 + ict_index_lag2 + ict_index_lag3 +
+                        total_points_lag1 + total_points_lag2 + total_points_lag3 +
+                        value + value_change3 + penalties_dummy +
+                        penalties_order*penalties_dummy + corner_dummy + corner_order*corner_dummy  +
+                        position + quarter)
+#Model
+tune_grid <- expand.grid(alpha = seq(0.99, 1, by = 0.005), lambda = seq(0, 0.1, by = 0.0025))
+set.seed(seed_object)
+model_glmnet_lag3 <- train(
+  formula_lag3, data = players_for_prediction,
+  metric = "RMSE",
+  method = "glmnet",
+  tuneGrid = tune_grid,
+  trControl = myControl,
+  na.action = na.omit
+)
+print(model_glmnet_lag3$bestTune)
+rm(formula_lag3, tune_grid)
+```
+
+####################################################################################
+#Chapter 7: Run prediction model for 2 lag
+####################################################################################
+
+Create dataset with skipped rows, and create model
+```{r, echo=FALSE}
+#Model
+formula_lag2 <- as.formula(total_points ~ selected + relative_difficulty + home + 
+                        minutes_lag1 + minutes_lag2 + 
+                        ict_index_lag1 + ict_index_lag2 + 
+                        total_points_lag1 + total_points_lag2 + 
+                        value + value_change2 + penalties_dummy +
+                        penalties_order*penalties_dummy + corner_dummy + corner_order*corner_dummy  +
+                        position + quarter)
+#Model
+tune_grid <- expand.grid(alpha = seq(0.99, 1, by = 0.005), lambda = seq(0, 0.1, by = 0.0025))
+set.seed(seed_object)
+model_glmnet_lag2 <- train(
+  formula_lag2, data = players_for_prediction,
+  metric = "RMSE",
+  method = "glmnet",
+  tuneGrid = tune_grid,
+  trControl = myControl,
+  na.action = na.omit
+)
+print(model_glmnet_lag2$bestTune)
+rm(formula_lag2, tune_grid)
+```
+
+####################################################################################
+#Chapter 8: Run prediction model for 1 lag
+####################################################################################
+
+Create dataset with skipped rows, and create model
+```{r, echo=FALSE}
+#Model
+formula_lag1 <- as.formula(total_points ~ selected + relative_difficulty + home + 
+                        minutes_lag1 + 
+                        ict_index_lag1 + 
+                        total_points_lag1 + 
+                        value + value_change1 + penalties_dummy +
+                        penalties_order*penalties_dummy + corner_dummy + corner_order*corner_dummy  +
+                        position + quarter)
+#Model
+tune_grid <- expand.grid(alpha = seq(0.99, 1, by = 0.005), lambda = seq(0, 0.1, by = 0.0025))
+set.seed(seed_object)
+model_glmnet_lag1 <- train(
+  formula_lag1, data = players_for_prediction,
+  metric = "RMSE",
+  method = "glmnet",
+  tuneGrid = tune_grid,
+  trControl = myControl,
+  na.action = na.omit
+)
+print(model_glmnet_lag1$bestTune)
+rm(formula_lag1, tune_grid)
+```
+
+####################################################################################
+#Chapter 9: Run prediction model for those with no game history
+####################################################################################
+
+Regression with ridge and lasso
+```{r, echo=FALSE}
+#Model
+formula_nolag <- as.formula(total_points ~ selected + relative_difficulty + home +
+         value + penalties_dummy + penalties_dummy*penalties_order + corner_dummy +
+           corner_dummy*corner_order + position + quarter)
+set.seed(seed_object)
+tune_grid <- expand.grid(alpha = seq(0.98, 1, by = 0.005), lambda = seq(0, 0.1, by = 0.0025))
+#Run
+model_glmnet_no_lag <- train(
+  formula_nolag, data = players_for_prediction,
+  metric = "RMSE",
+  method = "glmnet",
+  trControl = myControl,
+  tuneGrid = tune_grid,
+  na.action = na.omit
+)
+print(model_glmnet_no_lag$bestTune) 
+rm(formula_nolag, tune_grid)
+```
+
+####################################################################################
+#Chapter 10: Read and compare models
+####################################################################################
+
+Compare models
+```{r, echo=FALSE}
+model_list <- list(lag6 = model_glmnet_lag6, lag5 = model_glmnet_lag5, lag4 = model_glmnet_lag4,
+                   lag3 = model_glmnet_lag3, lag2 = model_glmnet_lag2, lag1 = model_glmnet_lag1,
+                   no_lag = model_glmnet_no_lag)
+resamples <- resamples(model_list)
+summary(resamples)
+bwplot(resamples, metric = "RMSE")
+```
+
+Explore variable importance
+```{r, echo=FALSE}
+varImp(model_glmnet_lag6)
+varImp(model_glmnet_lag5)
+varImp(model_glmnet_lag4)
+varImp(model_glmnet_lag3)
+varImp(model_glmnet_lag2)
+varImp(model_glmnet_lag1)
+varImp(model_glmnet_no_lag)
+```
+
+Explore coefficients
+```{r, echo=FALSE}
+coefficients <- as.matrix(coef(model_glmnet_lag4$finalModel, model_glmnet_lag4$bestTune$lambda))
+```
+
+Remove objects
+```{r, echo=FALSE}
+rm(model_list, resamples, myControl, coefficients)
+```
+
+Save models (in a memory light way by stripping out the heavy model objects that aren't needed)
+```{r, echo=FALSE}
+model_glmnet_lag6[c("trainingData", "pred", "control", "na.action")] <- NULL
+model_glmnet_lag5[c("trainingData", "pred", "control", "na.action")] <- NULL
+model_glmnet_lag4[c("trainingData", "pred", "control", "na.action")] <- NULL
+model_glmnet_lag3[c("trainingData", "pred", "control", "na.action")] <- NULL
+model_glmnet_lag2[c("trainingData", "pred", "control", "na.action")] <- NULL
+model_glmnet_lag1[c("trainingData", "pred", "control", "na.action")] <- NULL
+model_glmnet_no_lag[c("trainingData", "pred", "control", "na.action")] <- NULL
+saveRDS(model_glmnet_lag6, "Models/Lasso_Ridge_Model_lag6.Rds")
+saveRDS(model_glmnet_lag5, "Models/Lasso_Ridge_Model_lag5.Rds")
+saveRDS(model_glmnet_lag4, "Models/Lasso_Ridge_Model_lag4.Rds")
+saveRDS(model_glmnet_lag3, "Models/Lasso_Ridge_Model_lag3.Rds")
+saveRDS(model_glmnet_lag2, "Models/Lasso_Ridge_Model_lag2.Rds")
+saveRDS(model_glmnet_lag1, "Models/Lasso_Ridge_Model_lag1.Rds")
+saveRDS(model_glmnet_no_lag, "Models/Lasso_Ridge_Model_No_Lag.Rds")
+```
+
+####################################################################################
+#Chapter 11: Explore predictions
+####################################################################################
+
+Explore predictions
+```{r, echo=FALSE}
+players_for_prediction <-  players_for_prediction %>%
+mutate(points_predicted_6lag = predict(model_glmnet_lag6, newdata = players_for_prediction, na.action = NULL),
+       points_predicted_5lag = predict(model_glmnet_lag5, newdata = players_for_prediction, na.action = NULL),
+       points_predicted_4lag = predict(model_glmnet_lag4, newdata = players_for_prediction, na.action = NULL),
+       points_predicted_3lag = predict(model_glmnet_lag3, newdata = players_for_prediction, na.action = NULL),
+       points_predicted_2lag = predict(model_glmnet_lag2, newdata = players_for_prediction, na.action = NULL),
+       points_predicted_1lag = predict(model_glmnet_lag1, newdata = players_for_prediction, na.action = NULL),
+       points_predicted_no_lag = predict(model_glmnet_no_lag, newdata = players_for_prediction, na.action = NULL))
+```
+
+
+Explore correlations between predictions and actual
+```{r, echo=FALSE}
+#Correlations
+cor(players_for_prediction$points_predicted_6lag, players_for_prediction$total_points, use="complete.obs")
+cor(players_for_prediction$points_predicted_5lag, players_for_prediction$total_points, use="complete.obs")
+cor(players_for_prediction$points_predicted_4lag, players_for_prediction$total_points, use="complete.obs")
+cor(players_for_prediction$points_predicted_3lag, players_for_prediction$total_points, use="complete.obs")
+cor(players_for_prediction$points_predicted_2lag, players_for_prediction$total_points, use="complete.obs")
+cor(players_for_prediction$points_predicted_1lag, players_for_prediction$total_points, use="complete.obs")
+cor(players_for_prediction$points_predicted_no_lag, players_for_prediction$total_points, use="complete.obs")
+#Graphs
+plot(players_for_prediction$points_predicted_4lag, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$points_predicted_4lag))
+plot(players_for_prediction$points_predicted_2lag, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$points_predicted_2lag))
+plot(players_for_prediction$points_predicted_1lag, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$points_predicted_1lag))
+plot(players_for_prediction$points_predicted_no_lag, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$points_predicted_no_lag))
+```
+
+Explore correlations between predictions, and variables
+```{r, echo=FALSE}
+#Graphs
+plot(players_for_prediction$value, players_for_prediction$points_predicted_4lag)
+abline(lm(players_for_prediction$points_predicted_4lag ~ players_for_prediction$value))
+plot(players_for_prediction$selected, players_for_prediction$points_predicted_4lag)
+abline(lm(players_for_prediction$points_predicted_4lag ~ players_for_prediction$selected))
+plot(players_for_prediction$relative_difficulty, players_for_prediction$points_predicted_4lag)
+abline(lm(players_for_prediction$points_predicted_4lag ~ players_for_prediction$relative_difficulty))
+plot(players_for_prediction$ict_index_lag1, players_for_prediction$points_predicted_4lag)
+abline(lm(players_for_prediction$points_predicted_4lag ~ players_for_prediction$ict_index_lag1))
+plot(players_for_prediction$total_points_lag1, players_for_prediction$points_predicted_4lag)
+abline(lm(players_for_prediction$points_predicted_4lag ~ players_for_prediction$total_points_lag1))
+plot(players_for_prediction$minutes_lag1, players_for_prediction$points_predicted_4lag)
+abline(lm(players_for_prediction$points_predicted_4lag ~ players_for_prediction$minutes_lag1))
+plot(players_for_prediction$penalties_dummy, players_for_prediction$points_predicted_4lag)
+abline(lm(players_for_prediction$points_predicted_4lag ~ players_for_prediction$penalties_dummy))
+```
+
+
+Explore correlations between actual, and variables
+```{r, echo=FALSE}
+#Graphs
+plot(players_for_prediction$value, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$value))
+plot(players_for_prediction$selected, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$selected))
+plot(players_for_prediction$relative_difficulty, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$relative_difficulty))
+plot(players_for_prediction$ict_index_lag1, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$ict_index_lag1))
+plot(players_for_prediction$total_points_lag1, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$total_points_lag1))
+plot(players_for_prediction$minutes_lag1, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$minutes_lag1))
+plot(players_for_prediction$penalties_dummy, players_for_prediction$total_points)
+abline(lm(players_for_prediction$total_points ~ players_for_prediction$penalties_dummy))
+```
+
+
+
+
+
+
