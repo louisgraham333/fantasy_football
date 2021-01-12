@@ -282,7 +282,7 @@ sum(previous_team[previous_team$first_11_new == 1,]$final_points) +
 
 Amount left over (UPDATE THIS)
 ```{r, echo=FALSE}
-amount_left_over <- 0
+amount_left_over <- 5
 ```
 
 Rank potential switches. Loop through each player, and see the best person they could be transferred for given the cost and the requirement for team shape
@@ -292,7 +292,7 @@ number_by_position <- previous_team %>%
   group_by(position) %>%
   summarise(number = n())
 #Loop through each player in the squad
-switch <- data.frame(matrix(ncol = 17, nrow = 0))
+switch <- data.frame(matrix(ncol = 21, nrow = 0))
 for(i in 1:nrow(previous_team)){
   #Give details on the current player
   switch[i,1] <- previous_team$name[i]
@@ -329,18 +329,24 @@ for(i in 1:nrow(previous_team)){
   switch[i,15] = df[df$final_points == sort(df$final_points, TRUE)[3]  & !is.na(df$final_points),]$final_points
   switch[i,16] = df[df$final_points == sort(df$final_points, TRUE)[3]  & !is.na(df$final_points),]$position
   switch[i,17] = df[df$final_points == sort(df$final_points, TRUE)[3]  & !is.na(df$final_points),]$now_cost
+  switch[i,18] = df[df$final_points == sort(df$final_points, TRUE)[4] & !is.na(df$final_points),]$name
+  switch[i,19] = df[df$final_points == sort(df$final_points, TRUE)[4]  & !is.na(df$final_points),]$final_points
+  switch[i,20] = df[df$final_points == sort(df$final_points, TRUE)[4]  & !is.na(df$final_points),]$position
+  switch[i,21] = df[df$final_points == sort(df$final_points, TRUE)[4]  & !is.na(df$final_points),]$now_cost
 }
 #Name the variables
 x <- c("current_name", "current_points", "current_position", "current_first_11", "current_now_cost",
        "trade_name", "trade_points", "trade_position", "current_now_cost",
        "second_trade_name", "second_trade_points", "second_trade_position", "second_current_now_cost",
-       "third_trade_name", "third_trade_points", "third_trade_position", "third_current_now_cost")
+       "third_trade_name", "third_trade_points", "third_trade_position", "third_current_now_cost",
+       "fourth_trade_name", "fourth_trade_points", "fourth_trade_position", "fourth_current_now_cost")
 colnames(switch) <- x
 rm(x, number_by_position, i, df)
 #Calculate point benefit
 switch$point_increase <- switch$trade_points - switch$current_points
 switch$point_increase2 <- switch$second_trade_points - switch$current_points
 switch$point_increase3 <- switch$third_trade_points - switch$current_points
+switch$point_increase4 <- switch$fourth_trade_points - switch$current_points
 #Choose person to transfer. Only include first team people
 switch2 <- switch[switch$current_first_11 == 1,]
 transfer_out <- switch[switch2$point_increase == max(switch2$point_increase),]$current_name

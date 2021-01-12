@@ -40,7 +40,7 @@ rm(miss_pkgs, pkgs, path)
 
 Open data 
 ```{r, echo=FALSE, message=FALSE}
-players_for_prediction <- readRDS("Data/Cleaned Data/Players historical data.rds")
+players_for_prediction <- readRDS("Cleaned Data/Players historical data.rds")
 ```
 
 ####################################################################################
